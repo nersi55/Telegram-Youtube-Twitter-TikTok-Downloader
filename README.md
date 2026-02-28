@@ -120,3 +120,7 @@ Distributed under the MIT License. See `LICENSE` for more information.
 ## 📞 Support
 - Open an [issue](../../issues) to report bugs
 ---
+
+
+
+You just need to send a cookies.txt (Json) to the bot for instagram 

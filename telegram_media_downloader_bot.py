@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import json
 
 # API Token for the bot (obtained from @BotFather)
-API_TOKEN = '7922399482:AAEcO0_YR3Zlicz5RF_0YzzvTyFnOQxfpgk'
+API_TOKEN = 'Token'
 
 # Temporary download path
 TEMP_DOWNLOAD_FOLDER = r'./downloads'

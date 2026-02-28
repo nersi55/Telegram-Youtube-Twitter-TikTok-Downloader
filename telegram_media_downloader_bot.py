@@ -14,6 +14,9 @@ API_TOKEN = '7922399482:AAEcO0_YR3Zlicz5RF_0YzzvTyFnOQxfpgk'
 # Temporary download path
 TEMP_DOWNLOAD_FOLDER = r'./downloads'
 
+# Cookie filename stored by the bot (inside TEMP_DOWNLOAD_FOLDER)
+COOKIES_FILENAME = 'cookies.txt'
+
 # Telegram size limit (50 MB)
 TELEGRAM_MAX_SIZE_MB = 50
 # Telegram caption max length
@@ -47,6 +50,22 @@ async def download_video(url, destination_folder, message, format="video"):
             'restrictfilenames': True,  # Limit special characters
             'progress_hooks': [lambda d: asyncio.create_task(download_progress(d, message))],  # Hook to show real-time progress
         }
+
+        # If cookies are provided via env var or stored file, add to options
+        cookie_env = os.environ.get('YT_DLP_COOKIES')
+        cookie_candidates = []
+        if cookie_env:
+            cookie_candidates.append(cookie_env)
+        cookie_candidates.append(os.path.join(TEMP_DOWNLOAD_FOLDER, COOKIES_FILENAME))
+        cookie_candidates.append(os.path.join(TEMP_DOWNLOAD_FOLDER, 'cookies.json'))
+        for cpath in cookie_candidates:
+            try:
+                if cpath and os.path.exists(cpath):
+                    options['cookiefile'] = cpath
+                    print(f"Using cookiefile: {cpath}")
+                    break
+            except Exception:
+                continue
 
         # Download the video or audio and save metadata (like tweet text) to a .txt file
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -167,6 +186,44 @@ def reduce_quality_ffmpeg(video_path, output_path, target_size_mb=50):
 async def start(update: Update, context: CallbackContext):
     await update.message.reply_text('Send a YouTube, Twitter/X, TikTok, or Instagram link (or just paste a link) and the bot will download it.\n'
                                     'If the file is larger than 50 MB, the quality will be reduced to send it.')
+
+
+async def setcookies(update: Update, context: CallbackContext):
+    await update.message.reply_text('To set cookies, upload your `cookies.txt` (or cookies.json) as a document with filename containing "cookie".\n'
+                                    'You can also set environment variable `YT_DLP_COOKIES` to point to a cookies file on disk.')
+
+
+async def removecookies(update: Update, context: CallbackContext):
+    path = os.path.join(TEMP_DOWNLOAD_FOLDER, COOKIES_FILENAME)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            await update.message.reply_text('Removed stored cookies.')
+        else:
+            await update.message.reply_text('No stored cookies were found.')
+    except Exception as e:
+        await update.message.reply_text(f'Error removing cookies: {e}')
+
+
+async def handle_document(update: Update, context: CallbackContext):
+    # Save uploaded cookies document if filename looks like a cookies file
+    doc = update.message.document
+    if not doc or not getattr(doc, 'file_name', None):
+        return
+    fname = doc.file_name.lower()
+    if 'cookie' in fname or fname.endswith('.json') or fname.endswith('.txt'):
+        os.makedirs(TEMP_DOWNLOAD_FOLDER, exist_ok=True)
+        save_path = os.path.join(TEMP_DOWNLOAD_FOLDER, COOKIES_FILENAME)
+        try:
+            file = await doc.get_file()
+            await file.download_to_drive(custom_path=save_path)
+            await update.message.reply_text(f'Saved cookies to {save_path}')
+        except Exception as e:
+            await update.message.reply_text(f'Failed to save cookies: {e}')
+    else:
+        # Not a cookies file; ignore or inform
+        await update.message.reply_text('Document received but filename does not look like a cookies file.\n'
+                                    'If this is your cookies file, include "cookie" in the filename or use /setcookies for instructions.')
 
 # Function to handle the /download command with format options
 async def download(update: Update, context: CallbackContext):
@@ -296,6 +353,8 @@ def main():
     # Handled commands
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('download', download))
+    application.add_handler(CommandHandler('setcookies', setcookies))
+    application.add_handler(CommandHandler('removecookies', removecookies))
     # Handle plain text messages (non-commands) and auto-start download if they contain supported links
     async def _message_listener(update: Update, context: CallbackContext):
         # Only trigger when the message contains a supported domain
@@ -304,6 +363,8 @@ def main():
             await download(update, context)
 
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), _message_listener))
+    # Handle uploaded documents (cookies files)
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     # Start the bot
     application.run_polling()

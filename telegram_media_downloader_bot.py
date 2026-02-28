@@ -3,17 +3,21 @@ import subprocess
 import yt_dlp
 import asyncio
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackContext
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackContext, MessageHandler, filters
 from telegram.error import TelegramError
+import re
+from urllib.parse import urlparse
 
 # API Token for the bot (obtained from @BotFather)
-API_TOKEN = 'YOUR-API-TOKEN'
+API_TOKEN = '7922399482:AAEcO0_YR3Zlicz5RF_0YzzvTyFnOQxfpgk'
 
 # Temporary download path
-TEMP_DOWNLOAD_FOLDER = r'C:\Users\'
+TEMP_DOWNLOAD_FOLDER = r'./downloads'
 
 # Telegram size limit (50 MB)
 TELEGRAM_MAX_SIZE_MB = 50
+# Telegram caption max length
+TELEGRAM_CAPTION_MAX = 1024
 
 # Function to handle real-time download progress
 async def download_progress(d, message):
@@ -44,13 +48,100 @@ async def download_video(url, destination_folder, message, format="video"):
             'progress_hooks': [lambda d: asyncio.create_task(download_progress(d, message))],  # Hook to show real-time progress
         }
 
-        # Download the video or audio
+        # Download the video or audio and save metadata (like tweet text) to a .txt file
         with yt_dlp.YoutubeDL(options) as ydl:
+            # Extract info first to get metadata without downloading
+            try:
+                info = ydl.extract_info(url, download=False)
+            except Exception:
+                info = None
+
+            # Perform the actual download
             ydl.download([url])
+
+        # If metadata was available, save the description/text to a .txt file
+        try:
+            if info and 'id' in info:
+                description = info.get('description') or info.get('fulltitle') or ''
+                if description:
+                    txt_path = os.path.join(destination_folder, f"{info['id']}.txt")
+                    with open(txt_path, 'w', encoding='utf-8') as f:
+                        f.write(description)
+        except Exception as e:
+            print(f"Warning: could not write metadata file: {e}")
+
         return True
     except Exception as e:
         print(f"Error during download: {e}")
         return False
+
+
+def find_supported_url(text: str):
+    """Return the first supported URL found in text, or None."""
+    if not text:
+        return None
+    # Find all http(s) URLs
+    urls = re.findall(r'https?://[^\s]+', text)
+    for u in urls:
+        # Strip surrounding punctuation
+        u_clean = u.strip('"\'"').rstrip('.,;:!?)]}')
+        try:
+            p = urlparse(u_clean)
+            host = p.netloc.lower()
+        except Exception:
+            continue
+        # Accept known domains (youtube, youtu.be, twitter/x, tiktok, instagram)
+        if host.endswith('youtube.com') or host == 'youtu.be' or host.endswith('twitter.com') or host.endswith('x.com') or host.endswith('tiktok.com') or host.endswith('instagram.com') or host.endswith('instagr.am'):
+            return u_clean
+    return None
+
+
+def extract_url_from_update(update: Update):
+    """Try to extract a supported URL from the Telegram Update (text, caption, or entities)."""
+    # Try plain text/caption first
+    text = update.message.text or ''
+    url = find_supported_url(text)
+    if url:
+        return url
+
+    caption = getattr(update.message, 'caption', None) or ''
+    url = find_supported_url(caption)
+    if url:
+        return url
+
+    # Try entities in text
+    entities = getattr(update.message, 'entities', None) or []
+    for ent in entities:
+        try:
+            if ent.type == 'text_link' and getattr(ent, 'url', None):
+                candidate = ent.url
+            elif ent.type == 'url' and text:
+                candidate = text[ent.offset: ent.offset + ent.length]
+            else:
+                continue
+        except Exception:
+            continue
+        candidate = candidate.strip('"\'"').rstrip('.,;:!?)]}')
+        if find_supported_url(candidate):
+            return candidate
+
+    # Try caption_entities
+    cap_ents = getattr(update.message, 'caption_entities', None) or []
+    for ent in cap_ents:
+        try:
+            if ent.type == 'text_link' and getattr(ent, 'url', None):
+                candidate = ent.url
+            elif ent.type == 'url' and caption:
+                candidate = caption[ent.offset: ent.offset + ent.length]
+            else:
+                continue
+        except Exception:
+            continue
+        candidate = candidate.strip('"\'"').rstrip('.,;:!?)]}')
+        if find_supported_url(candidate):
+            return candidate
+
+    return None
 
 # Function to reduce video quality if it's too large using ffmpeg
 def reduce_quality_ffmpeg(video_path, output_path, target_size_mb=50):
@@ -74,65 +165,124 @@ def reduce_quality_ffmpeg(video_path, output_path, target_size_mb=50):
 
 # Function to handle the /start command
 async def start(update: Update, context: CallbackContext):
-    await update.message.reply_text('Send a YouTube, Twitter/X, or TikTok link using /download <url>.\n'
+    await update.message.reply_text('Send a YouTube, Twitter/X, TikTok, or Instagram link (or just paste a link) and the bot will download it.\n'
                                     'If the file is larger than 50 MB, the quality will be reduced to send it.')
 
 # Function to handle the /download command with format options
 async def download(update: Update, context: CallbackContext):
     try:
-        # Extract the text sent after the command
-        message_text = update.message.text
+        # Extract the text sent in the message
+        message_text = update.message.text or ''
 
-        # Check if the message contains a valid URL from YouTube, Twitter/X, or TikTok
-        if any(domain in message_text for domain in ["https://www.youtube.com/", "https://youtu.be/", "https://twitter.com/", "https://x.com/", "https://www.tiktok.com/"]):
-            params = message_text.split(" ")
-            url = params[1]  # Extract the URL after the command
-            format = "video" if len(params) < 3 or params[2].lower() != "audio" else "audio"
-            destination_folder = TEMP_DOWNLOAD_FOLDER  # Use the temporary download folder
+        # Determine URL and format. Support both `/download <url>` and plain messages with a URL.
+        url = None
+        format = 'video'
 
-            # Send the initial message and keep it for updates
-            message = await update.message.reply_text(f'Starting the {format} download from: {url}')
+        if message_text.strip().startswith('/download'):
+            params = message_text.split()
+            if len(params) >= 2:
+                url = params[1].strip()
+            if len(params) >= 3 and params[2].lower() == 'audio':
+                format = 'audio'
+        else:
+            url = find_supported_url(message_text)
+            if not url:
+                # Fallback: try to extract from entities/caption
+                url = extract_url_from_update(update)
+            if 'audio' in message_text.split():
+                format = 'audio'
 
-            # Start the download and update the same message
-            success_download = await download_video(url, destination_folder, message, format)
+        # Validate URL
+        if not url:
+            await update.message.reply_text('Please provide a valid YouTube, Twitter/X, or TikTok URL.')
+            return
 
-            if not success_download:
-                await message.edit_text('Error during the video download. Please try again later.')
+        destination_folder = TEMP_DOWNLOAD_FOLDER  # Use the temporary download folder
+        os.makedirs(destination_folder, exist_ok=True)
+
+        # Send the initial message and keep it for updates
+        message = await update.message.reply_text(f'Starting the {format} download from: {url}')
+
+        # Start the download and update the same message
+        success_download = await download_video(url, destination_folder, message, format)
+
+        if not success_download:
+            await message.edit_text('Error during the video download. Please try again later.')
+            return
+
+        # Get the name of the downloaded media file (prefer media extensions, ignore .txt)
+        media_exts = {'.mp4', '.mkv', '.webm', '.mov', '.flv', '.mp3', '.m4a', '.aac', '.wav'}
+        all_files = [f for f in os.listdir(destination_folder)]
+        media_files = [os.path.join(destination_folder, f) for f in all_files if os.path.splitext(f)[1].lower() in media_exts]
+        if not media_files:
+            # fallback: any file except .txt
+            media_files = [os.path.join(destination_folder, f) for f in all_files if not f.lower().endswith('.txt')]
+        if not media_files:
+            # last resort: take any file
+            media_files = [os.path.join(destination_folder, f) for f in all_files]
+
+        if not media_files:
+            await message.edit_text('Downloaded file not found.')
+            return
+
+        video_filename = max(media_files, key=os.path.getctime)
+
+        # Check the file size
+        file_size_mb = os.path.getsize(video_filename) / (1024 * 1024)
+        if file_size_mb > TELEGRAM_MAX_SIZE_MB:
+            await message.edit_text(f'The file is too large ({file_size_mb:.2f} MB). '
+                                    f'Reducing the quality to meet the 50 MB limit...')
+
+            # Attempt to reduce the quality using ffmpeg
+            output_filename = os.path.join(destination_folder, 'compressed_' + os.path.basename(video_filename))
+            success_reduce = reduce_quality_ffmpeg(video_filename, output_filename, TELEGRAM_MAX_SIZE_MB)
+
+            if not success_reduce:
+                await message.edit_text('Error reducing the video quality. Please try again later.')
                 return
 
-            # Get the name of the downloaded file
-            video_filename = max([os.path.join(destination_folder, f) for f in os.listdir(destination_folder)], key=os.path.getctime)
+            # Switch to the compressed file for sending
+            video_filename = output_filename
 
-            # Check the file size
-            file_size_mb = os.path.getsize(video_filename) / (1024 * 1024)
-            if file_size_mb > TELEGRAM_MAX_SIZE_MB:
-                await message.edit_text(f'The file is too large ({file_size_mb:.2f} MB). '
-                                        f'Reducing the quality to meet the 50 MB limit...')
+        # Send the video/audio file to the user
+        await message.edit_text(f'Sending the {format}...')
+        # If a .txt with the same id exists, use it as the caption
+        caption = None
+        try:
+            txt_path = os.path.splitext(video_filename)[0] + '.txt'
+            if os.path.exists(txt_path):
+                with open(txt_path, 'r', encoding='utf-8') as tf:
+                    caption = tf.read()
+        except Exception as e:
+            print(f"Warning reading caption file: {e}")
 
-                # Attempt to reduce the quality using ffmpeg
-                output_filename = os.path.join(destination_folder, 'compressed_' + os.path.basename(video_filename))
-                success_reduce = reduce_quality_ffmpeg(video_filename, output_filename, TELEGRAM_MAX_SIZE_MB)
+        # Truncate caption if too long for Telegram; send only up to TELEGRAM_CAPTION_MAX characters
+        caption_to_send = None
+        if caption:
+            if len(caption) > TELEGRAM_CAPTION_MAX:
+                caption_to_send = caption[:TELEGRAM_CAPTION_MAX]
+            else:
+                caption_to_send = caption
 
-                if not success_reduce:
-                    await message.edit_text('Error reducing the video quality. Please try again later.')
-                    return
-
-                # Switch to the compressed file for sending
-                video_filename = output_filename
-
-            # Send the video/audio file to the user
-            await message.edit_text(f'Sending the {format}...')
+        try:
+            with open(video_filename, 'rb') as vf:
+                if format == 'audio':
+                    await update.message.reply_audio(audio=vf, caption=caption_to_send if caption_to_send else None)
+                else:
+                    await update.message.reply_video(video=vf, caption=caption_to_send if caption_to_send else None)
+        except TelegramError as e:
+            await message.edit_text(f'Error sending the file: {e}')
+            print(f"Error sending the file: {e}")
+        finally:
+            # Delete the downloaded media file and associated txt metadata
             try:
-                await update.message.reply_video(video=open(video_filename, 'rb'))
-            except TelegramError as e:
-                await message.edit_text(f'Error sending the file: {e}')
-                print(f"Error sending the file: {e}")
-            finally:
-                # Delete the downloaded file (optional)
                 if os.path.exists(video_filename):
                     os.remove(video_filename)
-        else:
-            await update.message.reply_text('Please provide a valid YouTube, Twitter/X, or TikTok URL.')
+                txt_path = os.path.splitext(video_filename)[0] + '.txt'
+                if os.path.exists(txt_path):
+                    os.remove(txt_path)
+            except Exception:
+                pass
 
     except Exception as e:
         await update.message.reply_text('An unexpected error occurred. Please try again later.')
@@ -146,6 +296,14 @@ def main():
     # Handled commands
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('download', download))
+    # Handle plain text messages (non-commands) and auto-start download if they contain supported links
+    async def _message_listener(update: Update, context: CallbackContext):
+        # Only trigger when the message contains a supported domain
+        text = update.message.text or ''
+        if find_supported_url(text):
+            await download(update, context)
+
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), _message_listener))
 
     # Start the bot
     application.run_polling()

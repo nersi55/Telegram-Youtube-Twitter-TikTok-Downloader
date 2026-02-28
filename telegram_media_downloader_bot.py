@@ -61,9 +61,18 @@ async def download_video(url, destination_folder, message, format="video"):
         for cpath in cookie_candidates:
             try:
                 if cpath and os.path.exists(cpath):
-                    options['cookiefile'] = cpath
-                    print(f"Using cookiefile: {cpath}")
-                    break
+                    # Normalize cookie file (some exporters use spaces or '#HttpOnly_' prefixes)
+                    norm_path = os.path.join(destination_folder, 'cookies_normalized.txt')
+                    try:
+                        normalize_cookiefile(cpath, norm_path)
+                        options['cookiefile'] = norm_path
+                        print(f"Using cookiefile (normalized): {norm_path}")
+                        break
+                    except Exception:
+                        # fallback to original
+                        options['cookiefile'] = cpath
+                        print(f"Using cookiefile: {cpath}")
+                        break
             except Exception:
                 continue
 
@@ -213,17 +222,127 @@ async def handle_document(update: Update, context: CallbackContext):
     fname = doc.file_name.lower()
     if 'cookie' in fname or fname.endswith('.json') or fname.endswith('.txt'):
         os.makedirs(TEMP_DOWNLOAD_FOLDER, exist_ok=True)
-        save_path = os.path.join(TEMP_DOWNLOAD_FOLDER, COOKIES_FILENAME)
+        # If JSON, save as cookies.json then convert; otherwise save directly as cookies.txt
         try:
             file = await doc.get_file()
-            await file.download_to_drive(custom_path=save_path)
-            await update.message.reply_text(f'Saved cookies to {save_path}')
+            if fname.endswith('.json'):
+                json_path = os.path.join(TEMP_DOWNLOAD_FOLDER, 'cookies.json')
+                await file.download_to_drive(custom_path=json_path)
+                # Try to convert JSON -> Netscape cookies.txt
+                try:
+                    convert_json_cookies_to_netscape(json_path, os.path.join(TEMP_DOWNLOAD_FOLDER, COOKIES_FILENAME))
+                    await update.message.reply_text(f'Converted and saved cookies to {os.path.join(TEMP_DOWNLOAD_FOLDER, COOKIES_FILENAME)}')
+                except Exception as e:
+                    await update.message.reply_text(f'Saved JSON cookies to {json_path} but failed to convert: {e}')
+            else:
+                save_path = os.path.join(TEMP_DOWNLOAD_FOLDER, COOKIES_FILENAME)
+                await file.download_to_drive(custom_path=save_path)
+                await update.message.reply_text(f'Saved cookies to {save_path}')
         except Exception as e:
             await update.message.reply_text(f'Failed to save cookies: {e}')
     else:
         # Not a cookies file; ignore or inform
         await update.message.reply_text('Document received but filename does not look like a cookies file.\n'
                                     'If this is your cookies file, include "cookie" in the filename or use /setcookies for instructions.')
+
+
+def convert_json_cookies_to_netscape(json_path: str, out_path: str):
+    """Convert a JSON cookie export (list or {'cookies': [...]}) to Netscape cookies.txt format.
+
+    Expects typical browser-exported JSON cookie formats.
+    """
+    import json
+    with open(json_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    if isinstance(data, dict) and 'cookies' in data:
+        cookies = data['cookies']
+    elif isinstance(data, list):
+        cookies = data
+    else:
+        # Try common wrapper keys
+        for k in ('cookie', 'cookies', 'items'):
+            if k in data and isinstance(data[k], list):
+                cookies = data[k]
+                break
+        else:
+            raise ValueError('Unrecognized JSON cookie format')
+
+    lines = ["# Netscape HTTP Cookie File"]
+    for c in cookies:
+        domain = c.get('domain') or c.get('host') or ''
+        if domain.startswith('.'): 
+            domain = domain
+        flag = 'TRUE' if domain.startswith('.') else 'FALSE'
+        path = c.get('path', '/')
+        secure = 'TRUE' if c.get('secure') or c.get('isSecure') else 'FALSE'
+        expiry = str(int(c.get('expiry') or c.get('expires') or 0))
+        name = c.get('name') or c.get('key') or ''
+        value = c.get('value') or c.get('val') or ''
+        # Ensure domain field is not empty
+        if not domain:
+            continue
+        lines.append('\t'.join([domain, flag, path, secure, expiry, name, value]))
+
+    with open(out_path, 'w', encoding='utf-8') as out:
+        out.write('\n'.join(lines))
+
+
+def normalize_cookiefile(in_path: str, out_path: str):
+    """Normalize cookie file into Netscape (tab-separated) format.
+
+    Handles space-separated exports and removes '#HttpOnly_' prefixes when present.
+    """
+    import re
+    with open(in_path, 'r', encoding='utf-8', errors='ignore') as inp:
+        lines = inp.readlines()
+
+    out_lines = []
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        # Keep header/comments
+        if s.startswith('# Netscape') or s.startswith('# http') or s.startswith('# This file'):
+            out_lines.append(s)
+            continue
+        # Remove leading '#HttpOnly_' used by some exporters
+        s2 = re.sub(r'^#HttpOnly_[\.]?', '', s)
+        # Remove accidental leading '#' before domain
+        if s2.startswith('#'):
+            s2 = s2.lstrip('#')
+        parts = re.split(r'\s+', s2)
+        # If already tab-separated, preserve
+        if '\t' in ln and len(parts) >= 7:
+            out_lines.append('\t'.join(parts))
+            continue
+        if len(parts) >= 7:
+            out_lines.append('\t'.join(parts[:7]))
+        else:
+            # fallback: keep original line
+            out_lines.append(s)
+
+    with open(out_path, 'w', encoding='utf-8') as out:
+        out.write('\n'.join(out_lines) + '\n')
+
+
+async def checkcookies(update: Update, context: CallbackContext):
+    """Check stored cookies for an Instagram sessionid entry."""
+    candidates = [os.path.join(TEMP_DOWNLOAD_FOLDER, COOKIES_FILENAME), os.path.join(TEMP_DOWNLOAD_FOLDER, 'cookies.json')]
+    found = False
+    for p in candidates:
+        if os.path.exists(p):
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    txt = f.read()
+                if 'sessionid' in txt.lower():
+                    await update.message.reply_text(f'Found sessionid in {p}')
+                    found = True
+                    break
+            except Exception:
+                continue
+    if not found:
+        await update.message.reply_text('No sessionid found in stored cookies. Make sure you exported cookies in Netscape format while logged in to Instagram.')
 
 # Function to handle the /download command with format options
 async def download(update: Update, context: CallbackContext):
